@@ -10,6 +10,10 @@
  * "orange" to that single reader makes the disabled-verification vbmeta
  * acceptable, while every later reader still sees the real bootloader
  * state.
+ *
+ * Optionally (CONFIG_ANDROID_DSU_AVB_VBMETA_VIEW) the vbmeta read view is
+ * also forced to VERIFICATION_DISABLED, so a stock vbmeta partition can be
+ * kept on disk.  SELinux is never touched.
  */
 
 #include <linux/android_dsu_avb.h>
@@ -24,9 +28,14 @@
 
 static atomic_t first_stage_active = ATOMIC_INIT(1);
 
+bool android_dsu_avb_first_stage(void)
+{
+	return atomic_read(&first_stage_active) != 0;
+}
+
 bool android_dsu_avb_bootconfig_active(void)
 {
-	return current->pid == 1 && atomic_read(&first_stage_active);
+	return current->pid == 1 && android_dsu_avb_first_stage();
 }
 
 static void dsu_avb_process_exec(void *unused, struct task_struct *task,
@@ -39,8 +48,10 @@ static void dsu_avb_process_exec(void *unused, struct task_struct *task,
 	    strcmp(bprm->filename, SYSTEM_INIT_PATH))
 		return;
 
-	if (atomic_cmpxchg(&first_stage_active, 1, 0) == 1)
+	if (atomic_cmpxchg(&first_stage_active, 1, 0) == 1) {
+		android_dsu_avb_view_stop();
 		pr_info("android-dsu-avb: first-stage orange view closed\n");
+	}
 }
 
 static int __init android_dsu_avb_init(void)
@@ -54,6 +65,11 @@ static int __init android_dsu_avb_init(void)
 		       error);
 		return error;
 	}
+
+	error = android_dsu_avb_view_start();
+	if (error)
+		pr_warn("android-dsu-avb: vbmeta read view unavailable (%d); bootconfig view still active\n",
+			error);
 
 	pr_info("android-dsu-avb: first-stage orange view enabled\n");
 	return 0;
