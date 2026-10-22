@@ -22,6 +22,7 @@ from pathlib import Path
 
 MARKER = "android_dsu_avb_bootconfig_active"
 CONFIG_SYMBOL = "ANDROID_DSU_AVB_BYPASS"
+VIEW_SYMBOL = "ANDROID_DSU_AVB_VBMETA_VIEW"
 
 HOOK_LINES = (
     "\n\tif (android_dsu_avb_bootconfig_active())\n"
@@ -39,6 +40,16 @@ config ANDROID_DSU_AVB_BYPASS
 \t  This lets first-stage AVB handling accept verification errors.
 \t  The helper does not change vbmeta contents or SELinux enforcement.
 \t  It applies to normal boots as well as DSU boots.
+
+config ANDROID_DSU_AVB_VBMETA_VIEW
+\tbool "Android first-stage vbmeta read-view override"
+\tdepends on BOOT_CONFIG && PROC_FS && TRACEPOINTS && KPROBES && BLOCK
+\tdefault n
+\thelp
+\t  Rewrite AVB headers read by PID 1 during first-stage init so they
+\t  report VERIFICATION_DISABLED, without touching the vbmeta partition
+\t  on disk.  The view is torn down when PID 1 execs /system/bin/init.
+\t  Nothing is written to storage and SELinux is not affected.
 
 """
 
@@ -153,14 +164,20 @@ def patch_kconfig(path: Path) -> None:
 
 def patch_makefile(path: Path) -> None:
     text = read_text(path)
-    if CONFIG_SYMBOL in text:
+    added = []
+    for symbol, obj in ((CONFIG_SYMBOL, "dsu_avb.o"),
+                        (VIEW_SYMBOL, "dsu_avb_view.o")):
+        if symbol in text:
+            continue
+        if not text.endswith("\n"):
+            text += "\n"
+        text += f"obj-$(CONFIG_{symbol})\t+= {obj}\n"
+        added.append(symbol)
+    if not added:
         log("Makefile entry already present; skipping")
         return
-    if not text.endswith("\n"):
-        text += "\n"
-    text += f"obj-$(CONFIG_{CONFIG_SYMBOL})\t+= dsu_avb.o\n"
     write_text(path, text)
-    log(f"patched {path}")
+    log(f"patched {path} ({', '.join(added)})")
 
 
 def set_config(defconfig: Path, symbol: str = CONFIG_SYMBOL) -> None:
@@ -178,6 +195,7 @@ def install_payloads(module_dir: Path, tree: Path) -> None:
     pairs = [
         (module_dir / "payload" / "android_dsu_avb.h", tree / "include/linux/android_dsu_avb.h"),
         (module_dir / "payload" / "dsu_avb.c", tree / "drivers/android/dsu_avb.c"),
+        (module_dir / "payload" / "dsu_avb_view.c", tree / "drivers/android/dsu_avb_view.c"),
     ]
     for src, dst in pairs:
         if not src.is_file():
@@ -193,7 +211,8 @@ def do_apply(module_dir: Path, tree: Path, defconfig: Path) -> None:
     patch_bootconfig(tree / "fs/proc/bootconfig.c")
     patch_kconfig(tree / "drivers/android/Kconfig")
     patch_makefile(tree / "drivers/android/Makefile")
-    set_config(defconfig)
+    set_config(defconfig, CONFIG_SYMBOL)
+    set_config(defconfig, VIEW_SYMBOL)
     log("after_patch complete")
 
 
@@ -216,6 +235,17 @@ def do_verify(tree: Path, defconfig: Path, strict: bool) -> None:
                    CONFIG_SYMBOL in read_text(tree / "drivers/android/Makefile")))
     checks.append(("defconfig enables it",
                    f"CONFIG_{CONFIG_SYMBOL}=y" in read_text(defconfig)))
+    checks.append(("view source installed",
+                   (tree / "drivers/android/dsu_avb_view.c").is_file()))
+    checks.append(("Kconfig view option present",
+                   f"config {VIEW_SYMBOL}" in read_text(tree / "drivers/android/Kconfig")))
+    checks.append(("Makefile view entry present",
+                   VIEW_SYMBOL in read_text(tree / "drivers/android/Makefile")))
+    checks.append(("defconfig enables view",
+                   f"CONFIG_{VIEW_SYMBOL}=y" in read_text(defconfig)))
+    checks.append(("view patches AVB flags",
+                   "AVB_FLAGS_OFFSET 120" in
+                   read_text(tree / "drivers/android/dsu_avb_view.c")))
 
     failed = 0
     for name, ok in checks:
