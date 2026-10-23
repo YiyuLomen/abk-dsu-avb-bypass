@@ -14,19 +14,23 @@
  * Nothing is written to storage.  The override exists only in the buffer
  * returned to PID 1 and is torn down when PID 1 execs /system/bin/init.
  *
- * The vbmeta header is big-endian; the flags field lives at offset 120.
+ * The vbmeta header is big-endian; the flags field lives at offset 120, so
+ * its least significant byte is at offset 123.
  */
 
 #include <linux/android_dsu_avb.h>
 #include <linux/atomic.h>
 #include <linux/blkdev.h>
+#include <linux/errno.h>
 #include <linux/fs.h>
+#include <linux/irqflags.h>
 #include <linux/kprobes.h>
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
+#include <linux/workqueue.h>
 
 #include <asm/ptrace.h>
 
@@ -41,6 +45,7 @@ struct vbmeta_view_slot {
 	struct file *file;
 	const struct file_operations *orig;
 	struct file_operations proxy;
+	bool in_use;
 };
 
 static struct vbmeta_view_slot view_slots[VIEW_SLOT_COUNT];
@@ -65,9 +70,22 @@ static inline void be32_put(u8 *p, u32 value)
 	p[3] = (u8)value;
 }
 
+static struct vbmeta_view_slot *slot_from_ops(
+	const struct file_operations *ops)
+{
+	int index;
+
+	for (index = 0; index < VIEW_SLOT_COUNT; index++) {
+		if (READ_ONCE(view_slots[index].in_use) &&
+		    &view_slots[index].proxy == ops)
+			return &view_slots[index];
+	}
+	return NULL;
+}
+
 /*
  * Force VERIFICATION_DISABLED into an AVB header sitting in user memory.
- * The header is untouched when the magic does not match, so ordinary
+ * The buffer is left untouched when the magic does not match, so ordinary
  * block device traffic is not affected.
  */
 static void patch_avb_header(unsigned long uaddr, size_t length)
@@ -76,6 +94,8 @@ static void patch_avb_header(unsigned long uaddr, size_t length)
 	u8 encoded[4];
 	u32 flags;
 
+	if (!android_dsu_avb_first_stage())
+		return;
 	if (length < sizeof(header))
 		return;
 	if (copy_from_user(header, (void __user *)uaddr, sizeof(header)))
@@ -100,11 +120,12 @@ static void patch_avb_header(unsigned long uaddr, size_t length)
 static ssize_t view_read(struct file *file, char __user *buf, size_t count,
 			 loff_t *pos)
 {
-	struct vbmeta_view_slot *slot;
+	struct vbmeta_view_slot *slot = slot_from_ops(file->f_op);
 	loff_t start = pos ? *pos : -1;
 	ssize_t ret;
 
-	slot = container_of(file->f_op, struct vbmeta_view_slot, proxy);
+	if (!slot || !slot->orig->read)
+		return -EINVAL;
 
 	ret = slot->orig->read(file, buf, count, pos);
 	if (ret > 0 && start == 0)
@@ -114,16 +135,24 @@ static ssize_t view_read(struct file *file, char __user *buf, size_t count,
 
 static ssize_t view_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
-	struct vbmeta_view_slot *slot;
+	struct vbmeta_view_slot *slot = slot_from_ops(iocb->ki_filp->f_op);
 	unsigned long uaddr = 0;
 	loff_t start = iocb->ki_pos;
 	size_t want = iov_iter_count(to);
 	ssize_t ret;
 
-	slot = container_of(iocb->ki_filp->f_op, struct vbmeta_view_slot, proxy);
+	if (!slot || !slot->orig->read_iter)
+		return -EINVAL;
 
-	if (start == 0 && iter_is_iovec(to) && to->iov && to->iov->iov_base)
-		uaddr = (unsigned long)to->iov->iov_base + to->iov_offset;
+	/*
+	 * read() on a block device reaches ->read_iter through
+	 * new_sync_read(), which uses ITER_UBUF on 6.6; pread() uses
+	 * ITER_IOVEC.  iter_iov_addr() covers both user-backed cases, and
+	 * 6.6 renamed the iovec member to __iov, so the raw field cannot be
+	 * used directly.
+	 */
+	if (start == 0 && want && to->user_backed)
+		uaddr = (unsigned long)iter_iov_addr(to);
 
 	ret = slot->orig->read_iter(iocb, to);
 
@@ -134,27 +163,37 @@ static ssize_t view_read_iter(struct kiocb *iocb, struct iov_iter *to)
 
 static int view_release(struct inode *inode, struct file *file)
 {
-	struct vbmeta_view_slot *slot;
+	struct vbmeta_view_slot *slot = slot_from_ops(file->f_op);
 	int ret = 0;
 
-	slot = container_of(file->f_op, struct vbmeta_view_slot, proxy);
+	if (!slot)
+		return 0;
+
 	if (slot->orig->release)
 		ret = slot->orig->release(inode, file);
 
 	WRITE_ONCE(file->f_op, slot->orig);
 	WRITE_ONCE(slot->file, NULL);
+	WRITE_ONCE(slot->in_use, false);
 	return ret;
 }
 
+/*
+ * Called from the vfs_read kprobe pre-handler, i.e. with preemption
+ * disabled: only touches fields under local_irq_save and never sleeps.
+ */
 static void view_attach(struct file *file)
 {
 	struct inode *inode = file_inode(file);
+	const struct file_operations *ops;
 	unsigned long flags;
 	int index;
 
 	if (!inode || !S_ISBLK(inode->i_mode))
 		return;
-	if (!file->f_op || !file->f_op->read_iter)
+
+	ops = READ_ONCE(file->f_op);
+	if (!ops || !ops->read_iter)
 		return;
 
 	local_irq_save(flags);
@@ -163,22 +202,25 @@ static void view_attach(struct file *file)
 			goto out;
 	}
 	for (index = 0; index < VIEW_SLOT_COUNT; index++) {
-		if (!READ_ONCE(view_slots[index].file)) {
-			view_slots[index].orig = file->f_op;
-			view_slots[index].proxy = *file->f_op;
-			/*
-			 * Only replace ->read when the original file has one.
-			 * Installing a non-NULL ->read for a file that used
-			 * ->read_iter would divert every read through it.
-			 */
-			if (file->f_op->read)
-				view_slots[index].proxy.read = view_read;
-			view_slots[index].proxy.read_iter = view_read_iter;
-			view_slots[index].proxy.release = view_release;
-			WRITE_ONCE(view_slots[index].file, file);
-			WRITE_ONCE(file->f_op, &view_slots[index].proxy);
-			goto out;
-		}
+		if (READ_ONCE(view_slots[index].in_use))
+			continue;
+
+		view_slots[index].orig = ops;
+		view_slots[index].proxy = *ops;
+		/*
+		 * Only replace ->read when the original file has one.
+		 * Installing a non-NULL ->read for a file that used
+		 * ->read_iter would divert every read through it; block
+		 * devices on 6.6 define read_iter only.
+		 */
+		if (ops->read)
+			view_slots[index].proxy.read = view_read;
+		view_slots[index].proxy.read_iter = view_read_iter;
+		view_slots[index].proxy.release = view_release;
+		WRITE_ONCE(view_slots[index].file, file);
+		WRITE_ONCE(view_slots[index].in_use, true);
+		WRITE_ONCE(file->f_op, &view_slots[index].proxy);
+		goto out;
 	}
 out:
 	local_irq_restore(flags);
@@ -188,7 +230,7 @@ static int view_vfs_read_pre(struct kprobe *probe, struct pt_regs *regs)
 {
 	(void)probe;
 
-	if (!current->pid || current->pid != 1)
+	if (current->pid != 1)
 		return 0;
 	if (!android_dsu_avb_first_stage())
 		return 0;
@@ -201,6 +243,36 @@ static struct kprobe view_vfs_read_kprobe = {
 	.symbol_name = "vfs_read",
 	.pre_handler = view_vfs_read_pre,
 };
+
+static void view_teardown(void)
+{
+	int index;
+
+	unregister_kprobe(&view_vfs_read_kprobe);
+	kprobe_live = false;
+
+	for (index = 0; index < VIEW_SLOT_COUNT; index++) {
+		struct vbmeta_view_slot *slot = &view_slots[index];
+
+		if (READ_ONCE(slot->file)) {
+			WRITE_ONCE(slot->file->f_op, slot->orig);
+			WRITE_ONCE(slot->file, NULL);
+		}
+		WRITE_ONCE(slot->in_use, false);
+	}
+
+	pr_info("android-dsu-avb: first-stage AVB read-view window closed (%llu header(s) patched)\n",
+		(unsigned long long)atomic64_read(&view_patched));
+}
+
+static void view_stop_work_fn(struct work_struct *work)
+{
+	(void)work;
+	if (kprobe_live)
+		view_teardown();
+}
+
+static DECLARE_WORK(view_stop_work, view_stop_work_fn);
 
 int android_dsu_avb_view_start(void)
 {
@@ -221,25 +293,14 @@ int android_dsu_avb_view_start(void)
 	return 0;
 }
 
+/*
+ * Called from the sched_process_exec tracepoint, which must not sleep:
+ * hand the real teardown (unregister_kprobe uses synchronize_rcu) to a
+ * workqueue.
+ */
 void android_dsu_avb_view_stop(void)
 {
-	int index;
-
 	if (!kprobe_live)
 		return;
-
-	unregister_kprobe(&view_vfs_read_kprobe);
-	kprobe_live = false;
-
-	for (index = 0; index < VIEW_SLOT_COUNT; index++) {
-		struct vbmeta_view_slot *slot = &view_slots[index];
-
-		if (slot->file) {
-			WRITE_ONCE(slot->file->f_op, slot->orig);
-			WRITE_ONCE(slot->file, NULL);
-		}
-	}
-
-	pr_info("android-dsu-avb: first-stage AVB read-view window closed (%llu header(s) patched)\n",
-		(unsigned long long)atomic64_read(&view_patched));
+	schedule_work(&view_stop_work);
 }
